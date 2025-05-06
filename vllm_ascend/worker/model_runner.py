@@ -490,119 +490,128 @@ class ModelInputForNPUBuilder(ModelRunnerInputBuilderBase[ModelInputForNPU]):
         """Finalize the builder intermediate data and
         create on-device tensors.
         """
-        # Combine and flatten intermediate data.
-        input_tokens = [
-            flatten_2d_lists(inter_data.input_tokens)
+        seq_lens = []
+        query_lens = []
+        lora_index_buffer = []
+        lora_prompt_buffer = []
+        max_decode_seq_len = 0
+        mrope_input_positions = None
+        has_mrope = any(
+            inter_data.mrope_input_positions is not None
             for inter_data in self.inter_data_list
-        ]
-        if not input_tokens:
+        )
+        is_prompt = self.inter_data_list[0].is_prompt
+
+        input_tokens_list = []
+        input_positions_list = [] if not has_mrope else None
+
+        for inter_data in self.inter_data_list:
+            input_tokens_list.extend(itertools.chain.from_iterable(inter_data.input_tokens))
+            
+            if not has_mrope:
+                input_positions_list.extend(
+                    itertools.chain.from_iterable(inter_data.input_positions)
+                )
+            current_seq_lens = inter_data.seq_lens
+            seq_lens.extend(current_seq_lens)
+            if not is_prompt:
+                current_max = max(current_seq_lens)
+                max_decode_seq_len = max(max_decode_seq_len, current_max)
+
+            query_lens.extend(inter_data.query_lens)
+
+            if self.enable_lora:
+                lora_index_buffer.extend(
+                    itertools.chain.from_iterable(inter_data.lora_index_mapping)
+                )
+                lora_prompt_buffer.extend(
+                    itertools.chain.from_iterable(inter_data.lora_prompt_mapping)
+                )
+
+        if not input_tokens_list:
             # This may happen when all prefill requests hit
             # prefix caching and there is no decode request.
             return self.model_input_cls()
 
-        mrope_input_positions: Optional[List[List[int]]] = None
-        if any(inter_data.mrope_input_positions is not None
-               for inter_data in self.inter_data_list):
-            mrope_input_positions = [[] for _ in range(3)]
-
-            for idx in range(3):
-                for inter_data in self.inter_data_list:
-                    msections = inter_data.mrope_input_positions
-                    if msections is None:
-                        for _seq_input_positions in inter_data.input_positions:
-                            mrope_input_positions[idx].extend(
-                                _seq_input_positions)
-                    else:
-                        for _seq_mrope_input_positions in msections:
-                            mrope_input_positions[idx].extend(
-                                _seq_mrope_input_positions[idx])
-            input_positions = None
-        else:
-            input_positions = [
-                flatten_2d_lists(inter_data.input_positions)
-                for inter_data in self.inter_data_list
-            ]
-
-        seq_lens = []
-        max_decode_seq_len = 0
-        is_prompt = self.inter_data_list[0].is_prompt
-        for inter_data in self.inter_data_list:
-            seq_lens.extend(inter_data.seq_lens)
-            if not inter_data.is_prompt:
-                max_decode_seq_len = max(max_decode_seq_len,
-                                         max(inter_data.seq_lens))
-        query_lens = flatten_2d_lists(
-            [inter_data.query_lens for inter_data in self.inter_data_list])
-        # Mapping from request IDs to sequence IDs. Used for Jamba models
-        # that manages the cache by itself.
-        request_ids_to_seq_ids = {
-            data.request_id: data.seq_ids
-            for data in self.inter_data_list
-        }
-
         # Add graph_pad_size here
         if self.runner.enable_graph_mode:
-            graph_pad_size = self.runner.scheduler_config.max_num_seqs - len(
-                seq_lens)
+            graph_pad_size = self.runner.scheduler_config.max_num_seqs - len(seq_lens)
+            if graph_pad_size > 0 and not is_prompt:
+                input_tokens_list += [0] * graph_pad_size
+                if not has_mrope:
+                    input_positions_list += [0] * graph_pad_size  # type: ignore
+                seq_lens += [1] * graph_pad_size
+                query_lens += [1] * graph_pad_size
         else:
             graph_pad_size = -1
 
-        #print(f"before tensor input_tokens: {input_tokens}")
-        #print(f"before tensor input_positions: {input_positions}")
-        #print(f"before list seq_lens: {seq_lens}")
-        input_tokens = flatten_2d_lists(input_tokens)
-        if input_positions:
-            input_positions = flatten_2d_lists(input_positions)
-        if graph_pad_size != -1 and not is_prompt:
-            input_tokens.extend(itertools.repeat(0, graph_pad_size))
-            input_positions.extend(  # type: ignore
-                itertools.repeat(0, graph_pad_size))
-            seq_lens.extend(itertools.repeat(1, graph_pad_size))
-            query_lens.extend(itertools.repeat(1, graph_pad_size))
-        input_tokens_tensor = torch.tensor(input_tokens,
-                                           dtype=torch.long,
-                                           device=self.runner.device)
-        if mrope_input_positions is not None:
-            input_positions_tensor = torch.tensor(mrope_input_positions,
-                                                  dtype=torch.long,
-                                                  device=self.runner.device)
+        input_tokens_flat = np.array(input_tokens_list, dtype=np.int64)
+        input_positions_flat = (
+            np.array(input_positions_list, dtype=np.int64) if not has_mrope else None
+        )
+
+        input_tokens_tensor = torch.as_tensor(
+            input_tokens_flat, dtype=torch.long, device=self.runner.device
+        )
+
+        if has_mrope:
+            mrope_input_positions = [[] for _ in range(3)]
+            for idx in range(3):
+                for inter_data in self.inter_data_list:
+                    if inter_data.mrope_input_positions is None:
+                        for seq_pos in inter_data.input_positions:
+                            mrope_input_positions[idx].extend(seq_pos)
+                    else:
+                        for seq_mrope in inter_data.mrope_input_positions:
+                            mrope_input_positions[idx].extend(seq_mrope[idx])
+            input_positions_tensor = torch.tensor(
+                mrope_input_positions, dtype=torch.long, device=self.runner.device
+            )
         else:
-            input_positions_tensor = torch.tensor(input_positions,
-                                                  dtype=torch.long,
-                                                  device=self.runner.device)
-        #print(f"after tensor input_tokens_tensor: {input_tokens_tensor}")
-        #print(f"after tensor input_positions_tensor: {input_positions_tensor}")
-        #print(f"after list seq_lens: {seq_lens}")
+            input_positions_tensor = torch.as_tensor(
+                input_positions_flat, dtype=torch.long, device=self.runner.device
+            )
 
         # Attention metadata.
         attn_metadata = self.attn_metadata_builder.build(
-            seq_lens, query_lens, graph_pad_size)
+            seq_lens,
+            query_lens,
+            graph_pad_size
+        )
 
         # LoRA data.
         lora_requests = set()
         lora_mapping = None
         if self.enable_lora:
-            lora_requests = set(r for data in self.inter_data_list
-                                for r in data.lora_requests)
-            lora_index_mapping = flatten_2d_lists([
-                flatten_2d_lists(inter_data.lora_index_mapping)
-                for inter_data in self.inter_data_list
-            ])
-            lora_prompt_mapping = flatten_2d_lists([
-                flatten_2d_lists(inter_data.lora_prompt_mapping)
-                for inter_data in self.inter_data_list
-            ])
-            lora_mapping = LoRAMapping(
-                **dict(index_mapping=lora_index_mapping,
-                       prompt_mapping=lora_prompt_mapping,
-                       is_prefill=not self.decode_only))
+            lora_requests = set(
+                itertools.chain.from_iterable(
+                    data.lora_requests for data in self.inter_data_list
+                )
+            )
+            lora_mapping = (
+                LoRAMapping(
+                    index_mapping=lora_index_buffer,
+                    prompt_mapping=lora_prompt_buffer,
+                    is_prefill=not self.decode_only,
+                )
+                if self.enable_lora
+                else None
+            )
 
         # Multi-modal data.
-        multi_modal_kwargs_list = [
-            data.multi_modal_kwargs for data in self.inter_data_list
-            if data.multi_modal_kwargs is not None
-        ]
-        multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
+        multi_modal_kwargs = MultiModalKwargs.batch(
+            [
+                data.multi_modal_kwargs
+                for data in self.inter_data_list
+                if data.multi_modal_kwargs is not None
+            ]
+        )
+
+        # Mapping from request IDs to sequence IDs. Used for Jamba models
+        # that manages the cache by itself.
+        request_ids_to_seq_ids = {
+            data.request_id: data.seq_ids for data in self.inter_data_list
+        }
 
         if self.runner.enable_graph_mode:
             torch._dynamo.mark_static(input_tokens_tensor)
@@ -620,7 +629,8 @@ class ModelInputForNPUBuilder(ModelRunnerInputBuilderBase[ModelInputForNPU]):
             lora_requests=lora_requests,
             multi_modal_kwargs=multi_modal_kwargs,
             request_ids_to_seq_ids=request_ids_to_seq_ids,
-            finished_requests_ids=self.finished_requests_ids)
+            finished_requests_ids=self.finished_requests_ids,
+        )
 
     def _compute_lens(self, inter_data: InterDataForSeqGroup, seq_idx: int,
                       seq_group_metadata: SequenceGroupMetadata):
